@@ -8,7 +8,7 @@ import pandas as pd
 import xml.etree.ElementTree as ET
 import functions_framework
 import google.auth
-from flask import redirect, make_response
+from flask import redirect, make_response, jsonify, Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
@@ -162,6 +162,24 @@ def process_backups(request):
         df_sms = df_sms.dropna(subset=['dt']).sort_values('dt')
         df_calls = df_calls.dropna(subset=['dt']).sort_values('dt')
 
+        # --- MODE 1: Interactive Contact Message Search (?name=... or ?phone=...) ---
+        phone_query = request.args.get('phone')
+        name_query = request.args.get('name')
+        if phone_query or name_query:
+            limit = int(request.args.get('limit', 10))
+            if phone_query:
+                filtered = df_sms[df_sms['address'].astype(str).str.contains(phone_query, na=False)]
+            else:
+                filtered = df_sms[df_sms['contact_name'].astype(str).str.contains(name_query, case=False, na=False)]
+
+            results = filtered.tail(limit).to_dict(orient='records')
+            return jsonify({
+                "query": {"phone": phone_query, "name": name_query},
+                "count": len(results),
+                "messages": results
+            }), 200
+
+        # --- MODE 2: Daily Follow-Up Digest Generation ---
         name_map = {}
         for df in [df_sms, df_calls]:
             valid = df[~df['contact_name'].isin(['(Unknown)', '', 'null', None])]
@@ -292,10 +310,7 @@ def build_html_digest(df_queue, ref_now, base_url):
         f"<p style='color:#666;font-size:20px;'>-{ref_now.strftime('%Y-%m-%d')} - {ref_now.strftime('%H%M')}</p>"
     ]
     
-    # SINGLE Master Table for all sections with exact locked column widths (Total = 1250px)
     parts.append("<table style='width:1250px;table-layout:fixed;border-collapse:collapse;font-size:17px;'>")
-    
-    # Global sizing row at the very top of the master table (Contact:250, Type:150, Date:150, Action:150, Snippet:600, VIP:50)
     parts.append("<tr style='height:0px;line-height:0px;'>"
                  "<th style='padding:0;border:0;width:250px;'></th>"
                  "<th style='padding:0;border:0;width:150px;'></th>"
@@ -307,8 +322,6 @@ def build_html_digest(df_queue, ref_now, base_url):
 
     for b in buckets:
         sub = df_queue[df_queue['bucket'] == b] if not df_queue.empty else pd.DataFrame()
-        
-        # Section Header Row spanning all 6 columns
         parts.append(f"<tr><td colspan='6' align='left' style='background:#f4f6f8;padding:12px;border-top:1px solid #dcdcdc;border-bottom:1px solid #dcdcdc;border-left:4px solid #1a73e8;font-weight:bold;font-size:19px;text-align:left;'>{b} ({len(sub)})</td></tr>")
         
         if sub.empty:
