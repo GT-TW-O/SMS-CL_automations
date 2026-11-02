@@ -121,6 +121,47 @@ def process_backups(request):
         download_file(drive_service, latest_sms['id'], local_sms_xml)
         download_file(drive_service, latest_calls['id'], local_calls_xml)
 
+        # --- MODE 1: Interactive Contact Message Search (Searches Full 2.3GB XML) ---
+        phone_query = request.args.get('phone')
+        name_query = request.args.get('name')
+        if phone_query or name_query:
+            limit = int(request.args.get('limit', 10))
+            matched_messages = []
+            
+            for event, elem in ET.iterparse(local_sms_xml, events=('end',)):
+                if elem.tag == 'sms':
+                    addr = elem.attrib.get('address', '')
+                    contact = elem.attrib.get('contact_name', '(Unknown)')
+                    body = clean_snippet(elem.attrib.get('body', ''))
+                    date_str = elem.attrib.get('readable_date', '')
+                    msg_type = 'Received' if elem.attrib.get('type') == '1' else 'Sent'
+                    
+                    match_found = False
+                    if phone_query and phone_query in addr:
+                        match_found = True
+                    if name_query and name_query.lower() in contact.lower():
+                        match_found = True
+                        
+                    if match_found:
+                        matched_messages.append({
+                            'readable_date': date_str,
+                            'address': addr,
+                            'contact_name': contact,
+                            'type': msg_type,
+                            'body': body
+                        })
+                elif elem.tag in ('mms', 'part', 'parts', 'addr', 'addrs'):
+                    elem.clear()
+
+            results = matched_messages[-limit:] if len(matched_messages) >= limit else matched_messages
+            return jsonify({
+                "query": {"phone": phone_query, "name": name_query},
+                "total_found": len(matched_messages),
+                "returned": len(results),
+                "messages": results
+            }), 200
+
+        # --- MODE 2: Daily Follow-Up Digest Generation ---
         sms_rows = []
         for event, elem in ET.iterparse(local_sms_xml, events=('end',)):
             if elem.tag == 'sms':
@@ -162,24 +203,6 @@ def process_backups(request):
         df_sms = df_sms.dropna(subset=['dt']).sort_values('dt')
         df_calls = df_calls.dropna(subset=['dt']).sort_values('dt')
 
-        # --- MODE 1: Interactive Contact Message Search (?name=... or ?phone=...) ---
-        phone_query = request.args.get('phone')
-        name_query = request.args.get('name')
-        if phone_query or name_query:
-            limit = int(request.args.get('limit', 10))
-            if phone_query:
-                filtered = df_sms[df_sms['address'].astype(str).str.contains(phone_query, na=False)]
-            else:
-                filtered = df_sms[df_sms['contact_name'].astype(str).str.contains(name_query, case=False, na=False)]
-
-            results = filtered.tail(limit).to_dict(orient='records')
-            return jsonify({
-                "query": {"phone": phone_query, "name": name_query},
-                "count": len(results),
-                "messages": results
-            }), 200
-
-        # --- MODE 2: Daily Follow-Up Digest Generation ---
         name_map = {}
         for df in [df_sms, df_calls]:
             valid = df[~df['contact_name'].isin(['(Unknown)', '', 'null', None])]
