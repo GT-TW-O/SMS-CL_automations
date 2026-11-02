@@ -3,6 +3,7 @@ import re
 import csv
 import datetime
 import urllib.parse
+import glob
 import numpy as np
 import pandas as pd
 import xml.etree.ElementTree as ET
@@ -106,62 +107,78 @@ def process_backups(request):
 
         sms_q = f"'{folder_id}' in parents and name contains 'sms-' and name contains '.xml' and trashed = false"
         calls_q = f"'{folder_id}' in parents and name contains 'calls-' and name contains '.xml' and trashed = false"
-        sms_files = drive_service.files().list(q=sms_q, orderBy="createdTime desc", pageSize=1, fields="files(id, name, createdTime)").execute().get('files', [])
+        sms_files = drive_service.files().list(q=sms_q, orderBy="createdTime desc", pageSize=50, fields="files(id, name, createdTime)").execute().get('files', [])
         calls_files = drive_service.files().list(q=calls_q, orderBy="createdTime desc", pageSize=1, fields="files(id, name, createdTime)").execute().get('files', [])
 
         if not sms_files or not calls_files:
             return {"status": "error", "message": "Missing sms-*.xml or calls-*.xml backup files."}, 404
 
-        latest_sms = sms_files[0]
         latest_calls = calls_files[0]
-
-        local_sms_xml = '/tmp/latest_sms.xml'
         local_calls_xml = '/tmp/latest_calls.xml'
-
-        download_file(drive_service, latest_sms['id'], local_sms_xml)
         download_file(drive_service, latest_calls['id'], local_calls_xml)
 
-        # --- MODE 1: Interactive Contact Message Search (Searches Full 2.3GB XML) ---
+        # --- MODE 1: Interactive Contact Message Search (Scans ALL historical SMS XML backups) ---
         phone_query = request.args.get('phone')
         name_query = request.args.get('name')
         if phone_query or name_query:
             limit = int(request.args.get('limit', 10))
             matched_messages = []
             
-            for event, elem in ET.iterparse(local_sms_xml, events=('end',)):
-                if elem.tag == 'sms':
-                    addr = elem.attrib.get('address', '')
-                    contact = elem.attrib.get('contact_name', '(Unknown)')
-                    body = clean_snippet(elem.attrib.get('body', ''))
-                    date_str = elem.attrib.get('readable_date', '')
-                    msg_type = 'Received' if elem.attrib.get('type') == '1' else 'Sent'
-                    
-                    match_found = False
-                    if phone_query and phone_query in addr:
-                        match_found = True
-                    if name_query and name_query.lower() in contact.lower():
-                        match_found = True
+            # Download and scan all historical sms-*.xml files present in Drive
+            for sms_file in sms_files:
+                temp_xml_path = f"/tmp/{sms_file['name']}"
+                if not os.path.exists(temp_xml_path):
+                    download_file(drive_service, sms_file['id'], temp_xml_path)
+                
+                for event, elem in ET.iterparse(temp_xml_path, events=('end',)):
+                    if elem.tag == 'sms':
+                        addr = elem.attrib.get('address', '')
+                        contact = elem.attrib.get('contact_name', '(Unknown)')
+                        body = clean_snippet(elem.attrib.get('body', ''))
+                        date_str = elem.attrib.get('readable_date', '')
+                        msg_type = 'Received' if elem.attrib.get('type') == '1' else 'Sent'
                         
-                    if match_found:
-                        matched_messages.append({
-                            'readable_date': date_str,
-                            'address': addr,
-                            'contact_name': contact,
-                            'type': msg_type,
-                            'body': body
-                        })
-                elif elem.tag in ('mms', 'part', 'parts', 'addr', 'addrs'):
-                    elem.clear()
+                        match_found = False
+                        if phone_query and phone_query in addr:
+                            match_found = True
+                        if name_query and name_query.lower() in contact.lower():
+                            match_found = True
+                            
+                        if match_found:
+                            matched_messages.append({
+                                'readable_date': date_str,
+                                'address': addr,
+                                'contact_name': contact,
+                                'type': msg_type,
+                                'body': body
+                            })
+                    elif elem.tag in ('mms', 'part', 'parts', 'addr', 'addrs'):
+                        elem.clear()
 
-            results = matched_messages[-limit:] if len(matched_messages) >= limit else matched_messages
+            # Deduplicate and sort chronologically
+            seen = set()
+            unique_messages = []
+            for m in matched_messages:
+                identifier = (m['readable_date'], m['body'])
+                if identifier not in seen:
+                    seen.add(identifier)
+                    unique_messages.append(m)
+
+            unique_messages.sort(key=lambda x: x['readable_date'])
+            results = unique_messages[-limit:] if len(unique_messages) >= limit else unique_messages
+
             return jsonify({
                 "query": {"phone": phone_query, "name": name_query},
-                "total_found": len(matched_messages),
+                "total_found": len(unique_messages),
                 "returned": len(results),
                 "messages": results
             }), 200
 
-        # --- MODE 2: Daily Follow-Up Digest Generation ---
+        # --- MODE 2: Daily Follow-Up Digest Generation (Uses latest XML) ---
+        latest_sms = sms_files[0]
+        local_sms_xml = '/tmp/latest_sms.xml'
+        download_file(drive_service, latest_sms['id'], local_sms_xml)
+
         sms_rows = []
         for event, elem in ET.iterparse(local_sms_xml, events=('end',)):
             if elem.tag == 'sms':
